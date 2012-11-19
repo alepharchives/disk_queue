@@ -26,6 +26,7 @@
 
 %%%_* Includes =========================================================
 %% -include_lib("disk_queue/include/disk_queue.hrl").
+-include_lib("kernel/include/file.hrl").
 
 %%%_* Macros ===========================================================
 -define(t_ptr, 0).
@@ -35,9 +36,9 @@
 
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
--record(f, { name  = throw(name)
+-record(f, { name  = undefined
            , start = 0
-           , fd    = throw(fd)
+           , fd    = undefined
            , size  = 0
            }).
 
@@ -82,8 +83,7 @@ init(Args) ->
 
 terminate(_Rsn, #s{archive=Archive, active=Active}) ->
   lists:foreach(fun(#f{fd=Fd}) -> ok = file:close(Fd) end, Archive),
-  ok = file:close(Active#f.fd),
-  ok.
+  ok = file:close(Active#f.fd).
 
 handle_call(stop, _From, S) ->
   {stop, normal, ok, S};
@@ -134,21 +134,44 @@ init_new(Path, Size) ->
          , r_ptr   = 0
          , w_ptr   = 0}}.
 
-%% init_old(Path, Size, Fs) ->
-  %% init_old(Fs, 0, 0).
+init_old(Path, Size, Fs0) ->
+  {ArchiveFiles, ActiveFile} = lists:split(erlang:length(Fs0)-1, Fs0),
+  Archive = open_archive(ArchiveFiles),
+  Active  = open_active(ActiveFile),
+  {RPtr, WPtr} = traverse(Archive, Active),
+  {ok, #s{ path    = Path
+         , size    = Size
+         , archive = Archive
+         , active  = Active
+         , r_ptr   = RPtr
+         , w_ptr   = WPtr}}.
 
-init_old([F|Fs], R, W) ->
-  %% _ = parse_filename(F),
-  case traverse(F) of
-    {ok, {short, RPtr, WPtr}} when Fs =:= [] -> ok;
-    {ok, {full,  RPtr, WPtr}} -> ok;
-    {error, Rsn}              -> {error, Rsn}
+open_archive(Fs) ->
+  lists:map(fun(F) ->
+                {ok, #file_info{size=Size}} = file:read_file_info(F),
+                {ok, Fd} = file:open(F, [read, binary]),
+                #f{name=F, fd=Fd, start=filename_parse(F), size=Size}
+            end, Fs).
+
+open_active(F) ->
+  {ok, #file_info{size=Size}} = file:read_file_info(F),
+  {ok, Fd} = file:open(F, [read, write, binary]),
+  #f{name=F, fd=Fd, start=filename_parse(F), size=Size}.
+
+traverse([#f{start=Start}|_]=Fs, Active) -> traverse(Fs, Active, Start, Start);
+traverse([], #f{start=Start}=Active)     -> traverse([], Active, Start, Start).
+
+traverse(Archive, Active, Offset, RPtr) ->
+  case read_next(Archive, Active, Offset) of
+    {ok, {mark, Ptr, NewOffset}} ->
+      traverse(Archive, Active, NewOffset, Ptr);
+    {ok, {entry, Bin, NewOffset}} ->
+      traverse(Archive, Active, NewOffset, RPtr);
+    {error, empty} ->
+      {RPtr, Offset};
+    {error, short_read} when Offset >= Active#f.start ->
+      {RPtr, Offset}
   end.
-
-traverse(File) ->
-  %% {ok, FD} = file:open(F, [read, write]),
-  %% traverse(FD, 0, 0).
-  ok.
 
 %%%_ * Internals Enqueue/Dequeue/Peek ----------------------------------
 do_enqueue(Term, File, WPtr) ->
@@ -284,6 +307,7 @@ basic_test() ->
   ok             = disk_queue:enqueue(Ref, baz),
   {ok, baz}      = disk_queue:peek(Ref),
   {ok, baz}      = disk_queue:dequeue(Ref),
+  {error, empty} = disk_queue:peek(Ref),
   ok             = disk_queue:stop(Ref),
   ok.
 
