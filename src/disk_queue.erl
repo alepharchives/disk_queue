@@ -92,6 +92,7 @@ handle_call({enqueue, Term}, _From, #s{} = S) ->
   {Active, WPtr}     = do_enqueue(Term, Active0, S#s.w_ptr),
   {reply, ok, S#s{archive=Archive, active=Active, w_ptr=WPtr}};
 handle_call(dequeue, _From, S) ->
+  io:format("DEQ: r_ptr=~p w_ptr=~p~n", [S#s.r_ptr, S#s.w_ptr]),
   {Archive0, Active0} = maybe_switch(S#s.archive, S#s.active, S#s.path, S#s.size),
   case do_dequeue(Archive0, Active0, S#s.r_ptr, S#s.w_ptr) of
     {ok, {Term, Active, RPtr, WPtr}} ->
@@ -125,7 +126,6 @@ code_change(_OldVsn, S, _Extra) ->
 %%%_ * Internals Init --------------------------------------------------
 init_new(Path, Size) ->
   Fn = filename_create(Path, 0),
-  io:format("FN: ~p~n", [Fn]),
   {ok, Fd} = file:open(Fn, [read, write, binary]),
   {ok, #s{ path    = Path
          , size    = Size
@@ -157,8 +157,6 @@ do_enqueue(Term, File, WPtr) ->
   Hash  = crypto:sha(Bin),
   Hdr   = <<?t_hdr:8/integer, Hash/binary, Size:64/integer>>,
   Entry = <<Hdr/binary, Bin/binary>>,
-  io:format("SIZE: ~p~n", [erlang:size(Entry)]),
-
   ok    = file:pwrite(File#f.fd, WPtr-File#f.start, Entry),
   Ez    = erlang:size(Entry),
   {File#f{size=File#f.size+Ez}, WPtr+Ez}.
@@ -200,23 +198,23 @@ read_next([], #f{start=Start, size=Size}, RPtr)
 read_next([#f{start=Start, size=Size}|Fs], Active, RPtr)
   when Start+Size =< RPtr -> read_next(Fs, Active, RPtr);
 read_next([#f{fd=Fd, start=Start}|_], _Active, RPtr) ->
-  read_next(Fd, RPtr-Start);
+  do_read_next(Fd, RPtr-Start, RPtr);
 read_next([], #f{fd=Fd, start=Start}, RPtr) ->
-  read_next(Fd, RPtr-Start).
+  do_read_next(Fd, RPtr-Start, RPtr).
 
-read_next(Fd, Offset) ->
-  case fd_read(Fd, Offset, 1) of
+do_read_next(Fd, Start, Offset) ->
+  case fd_read(Fd, Start, 1) of
     {ok, <<?t_ptr:8/integer>>} ->
-      case fd_read(Fd, Offset+1, 8) of
+      case fd_read(Fd, Start+1, 8) of
         {ok, <<Ptr:64/integer>>} ->
           {ok, {mark, Ptr, Offset+9}};
         eof ->
           {error, short_read}
       end;
     {ok, <<?t_hdr:8/integer>>} ->
-      case fd_read(Fd, Offset+1, 28) of
+      case fd_read(Fd, Start+1, 28) of
         {ok, <<Hash:20/binary, Size:64/integer>>} ->
-          case fd_read(Fd, Offset+29, Size) of
+          case fd_read(Fd, Start+29, Size) of
             {ok, Bin} ->
               case crypto:sha(Bin) of
                 Hash -> {ok, {entry, Bin, Offset+29+Size}};
@@ -232,7 +230,7 @@ read_next(Fd, Offset) ->
       {error, empty}
   end.
 
-maybe_switch(Archive, #f{fd=Fd, size=Fz} = Active, _Path, Size)
+maybe_switch(Archive, #f{size=Fz} = Active, _Path, Size)
   when Fz < Size ->
   {Archive, Active};
 maybe_switch(Archive, F, Path, _Size) ->
