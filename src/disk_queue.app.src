@@ -1,0 +1,8 @@
+%%-*- erlang-indent-level: 2 -*-
+{application, disk_queue,
+ [ {description, ""}
+ , {vsn, "0.1"}
+ , {registered, []}
+ , {applications, [kernel, stdlib]}
+ , {env, []}
+]}.
