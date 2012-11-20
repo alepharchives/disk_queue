@@ -1,0 +1,12 @@
+A small persistent queue implementation.
+
+Basically just appends data to file. When the current file opened
+for writing reaches a certain threshold a new one is created and
+writes go there.
+
+Files containing consumed (dequeued) entries are garbage collected.
+
+Please look at the testcases for documentation.
+
+Note that all existing files are traversed on startup.
+

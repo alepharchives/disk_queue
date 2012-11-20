@@ -1,5 +1,5 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%% @doc
+%%% @doc A small persistent queue
 %%% @copyright Bjorn Jensen-Urstad 2012
 %%% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -31,8 +31,6 @@
 %%%_* Macros ===========================================================
 -define(t_ptr, 0).
 -define(t_hdr, 1).
--define(size_t_ptr, (1+8)).
--define(size_t_hdr, (1+20+8)).
 
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
@@ -87,30 +85,34 @@ terminate(_Rsn, #s{archive=Archive, active=Active}) ->
 
 handle_call(stop, _From, S) ->
   {stop, normal, ok, S};
-handle_call({enqueue, Term}, _From, #s{} = S) ->
-  {Archive, Active0} = maybe_switch(S#s.archive, S#s.active, S#s.path, S#s.size),
-  {Active, WPtr}     = do_enqueue(Term, Active0, S#s.w_ptr),
+handle_call({enqueue, Term}, _From, S) ->
+  {Archive, Active0} =
+    maybe_switch(S#s.archive, S#s.active, S#s.path, S#s.size),
+  {Active, WPtr} = do_enqueue(Term, Active0, S#s.w_ptr),
   {reply, ok, S#s{archive=Archive, active=Active, w_ptr=WPtr}};
 handle_call(dequeue, _From, S) ->
-  io:format("DEQ: r_ptr=~p w_ptr=~p~n", [S#s.r_ptr, S#s.w_ptr]),
-  {Archive0, Active0} = maybe_switch(S#s.archive, S#s.active, S#s.path, S#s.size),
+  {Archive0, Active0} =
+    maybe_switch(S#s.archive, S#s.active, S#s.path, S#s.size),
   case do_dequeue(Archive0, Active0, S#s.r_ptr, S#s.w_ptr) of
     {ok, {Term, Active, RPtr, WPtr}} ->
       Archive = maybe_gc(Archive0, RPtr),
-      {reply, {ok, Term}, S#s{archive = Archive,
-                              active  = Active,
-                              r_ptr   = RPtr,
-                              w_ptr   = WPtr}};
+      {reply, {ok, Term}, S#s{ archive = Archive
+                             , active  = Active
+                             , r_ptr   = RPtr
+                             , w_ptr   = WPtr}};
     {error, empty} ->
-      {reply, {error, empty}, S#s{archive = Archive0,
-                                  active  = Active0}}
+      %% possible to move readpointer to writepointer..
+      {reply, {error, empty}, S#s{ archive = Archive0
+                                 , active  = Active0
+                                 , r_ptr   = S#s.w_ptr}}
   end;
 handle_call(peek, _From, S) ->
   case do_peek(S#s.archive, S#s.active, S#s.r_ptr) of
     {ok, Term} ->
       {reply, {ok, Term}, S};
     {error, empty} ->
-      {reply, {error, empty}, S}
+      %% possible to move readpointer to writepointer..
+      {reply, {error, empty}, S#s{r_ptr=S#s.w_ptr}}
   end.
 
 handle_cast(_Msg, S) ->
@@ -138,7 +140,11 @@ init_old(Path, Size, Fs0) ->
   {ArchiveFiles, ActiveFile} = lists:split(erlang:length(Fs0)-1, Fs0),
   Archive = open_archive(ArchiveFiles),
   Active  = open_active(ActiveFile),
-  {RPtr, WPtr} = traverse(Archive, Active),
+  Start   = case Archive of
+              []    -> Active#f.start;
+              [F|_] -> F#f.start
+            end,
+  {RPtr, WPtr} = traverse(Archive, Active, Start, Start),
   {ok, #s{ path    = Path
          , size    = Size
          , archive = Archive
@@ -158,18 +164,17 @@ open_active(F) ->
   {ok, Fd} = file:open(F, [read, write, binary]),
   #f{name=F, fd=Fd, start=filename_parse(F), size=Size}.
 
-traverse([#f{start=Start}|_]=Fs, Active) -> traverse(Fs, Active, Start, Start);
-traverse([], #f{start=Start}=Active)     -> traverse([], Active, Start, Start).
-
 traverse(Archive, Active, Offset, RPtr) ->
   case read_next(Archive, Active, Offset) of
     {ok, {mark, Ptr, NewOffset}} ->
       traverse(Archive, Active, NewOffset, Ptr);
-    {ok, {entry, Bin, NewOffset}} ->
+    {ok, {entry, _Bin, NewOffset}} ->
       traverse(Archive, Active, NewOffset, RPtr);
     {error, empty} ->
       {RPtr, Offset};
     {error, short_read} when Offset >= Active#f.start ->
+      %% not the whole entry was written/synced to disk
+      %% this is ok if it's the last file
       {RPtr, Offset}
   end.
 
@@ -201,7 +206,7 @@ do_peek(Archive, Active, RPtr) ->
   case read_next(Archive, Active, RPtr) of
     {ok, {mark, _Ptr, NewPtr}} ->
       do_peek(Archive, Active, NewPtr);
-    {ok, {entry, Bin, NewPtr}} ->
+    {ok, {entry, Bin, _NewPtr}} ->
       {ok, erlang:binary_to_term(Bin)};
     {error, empty} ->
       {error, empty}
@@ -226,18 +231,19 @@ read_next([], #f{fd=Fd, start=Start}, RPtr) ->
   do_read_next(Fd, RPtr-Start, RPtr).
 
 do_read_next(Fd, Start, Offset) ->
-  case fd_read(Fd, Start, 1) of
+  %% lots of tiny reads, rely on os reading larger blocks and cache
+  case pread(Fd, Start, 1) of
     {ok, <<?t_ptr:8/integer>>} ->
-      case fd_read(Fd, Start+1, 8) of
+      case pread(Fd, Start+1, 8) of
         {ok, <<Ptr:64/integer>>} ->
           {ok, {mark, Ptr, Offset+9}};
         eof ->
           {error, short_read}
       end;
     {ok, <<?t_hdr:8/integer>>} ->
-      case fd_read(Fd, Start+1, 28) of
+      case pread(Fd, Start+1, 28) of
         {ok, <<Hash:20/binary, Size:64/integer>>} ->
-          case fd_read(Fd, Start+29, Size) of
+          case pread(Fd, Start+29, Size) of
             {ok, Bin} ->
               case crypto:sha(Bin) of
                 Hash -> {ok, {entry, Bin, Offset+29+Size}};
@@ -253,26 +259,27 @@ do_read_next(Fd, Start, Offset) ->
       {error, empty}
   end.
 
-maybe_switch(Archive, #f{size=Fz} = Active, _Path, Size)
-  when Fz < Size ->
+maybe_switch(Archive, #f{size=Size} = Active, _Path, MaxSize)
+  when Size < MaxSize ->
   {Archive, Active};
-maybe_switch(Archive, F, Path, _Size) ->
-  ok          = file:sync(F#f.fd),
-  ok          = file:close(F#f.fd),
-  NewName     = filename_create(Path, F#f.start+F#f.size),
-  {ok, OldFd} = file:open(F#f.name, [read, binary]),
+maybe_switch(Archive, Active, Path, _Size) ->
+  ok          = file:sync(Active#f.fd),
+  ok          = file:close(Active#f.fd),
+  NewName     = filename_create(Path, Active#f.start+Active#f.size),
+  {ok, OldFd} = file:open(Active#f.name, [read, binary]),
   {ok, NewFd} = file:open(NewName, [read, write, binary]),
-  {Archive++[F#f{fd=OldFd}], #f{name  = NewName,
-                                fd    = NewFd,
-                                start = F#f.start+F#f.size
-                               }}.
+  {Archive++[Active#f{fd=OldFd}],
+   #f{ name  = NewName
+     , fd    = NewFd
+     , start = Active#f.start+Active#f.size
+     }}.
 
-fd_read(Fd, Offset, Bytes) ->
-  io:format("FD: ~p~nOffset: ~p~nBytes: ~p~n", [Fd,Offset,Bytes]),
+pread(Fd, Offset, Bytes) ->
   case file:pread(Fd, Offset, Bytes) of
-    {ok, <<Bin:Bytes/binary>>} -> {ok, Bin};
-    {ok, _}                    -> eof;
-    eof                        -> eof
+    {ok, Bin}
+      when erlang:size(Bin) =:= Bytes -> {ok, Bin};
+    {ok, _}                           -> eof; %consider short reads eof
+    eof                               -> eof
   end.
 
 %%%_ * Misc ------------------------------------------------------------
@@ -297,8 +304,16 @@ assoc(K, L) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
+clean_dir(Path) ->
+  ensure_path(Path),
+  lists:foreach(fun(F) ->
+                    ok = file:delete(F)
+                end,
+                filelib:wildcard(filename:join([Path, "dq_*"]))).
+
 basic_test() ->
-  {ok, Ref}      = disk_queue:start_link([{size, 10000}, {path, "tmp"}]),
+  clean_dir("tmp"),
+  {ok, Ref}      = disk_queue:start_link([{size, 1000}, {path, "tmp"}]),
   ok             = disk_queue:enqueue(Ref, foo),
   ok             = disk_queue:enqueue(Ref, bar),
   {ok, foo}      = disk_queue:dequeue(Ref),
@@ -312,16 +327,37 @@ basic_test() ->
   ok.
 
 persistant_queue_test() ->
-  {ok, Ref1} = disk_queue:start_link([{size, 100}, {path, "tmp"}]),
+  clean_dir("tmp"),
+  {ok, Ref1} = disk_queue:start_link([{size, 50}, {path, "tmp"}]),
   ok         = disk_queue:enqueue(Ref1, foo),
   ok         = disk_queue:enqueue(Ref1, bar),
+  ok         = disk_queue:enqueue(Ref1, baz),
+  {ok, foo}  = disk_queue:dequeue(Ref1),
   ok         = disk_queue:stop(Ref1),
   {ok, Ref2} = disk_queue:start_link([{size, 100}, {path, "tmp"}]),
   ok         = disk_queue:enqueue(Ref2, baz),
-  {ok, foo}  = disk_queue:dequeue(Ref2),
   {ok, bar}  = disk_queue:dequeue(Ref2),
   {ok, baz}  = disk_queue:dequeue(Ref2),
+  {ok, baz}  = disk_queue:dequeue(Ref2),
   ok         = disk_queue:stop(Ref2),
+  ok.
+
+short_read_test() ->
+  clean_dir("tmp"),
+  {ok, Ref1} = disk_queue:start_link([{size, 50}, {path, "tmp"}]),
+  ok = disk_queue:enqueue(Ref1, foo),
+  ok = disk_queue:enqueue(Ref1, bar),
+  ok = disk_queue:stop(Ref1),
+  Files = lists:sort(filelib:wildcard(filename:join(["tmp", "dq_*"]))),
+  [Lastfile|_] = lists:reverse(Files),
+  {ok, Fd} = file:open(Lastfile, [append, binary]),
+  ok = file:write(Fd, <<?t_hdr:8/integer>>),
+  ok = file:close(Fd),
+  {ok, Ref2} = disk_queue:start_link([{size, 100}, {path, "tmp"}]),
+  {ok, foo} = disk_queue:dequeue(Ref2),
+  {ok, bar} = disk_queue:dequeue(Ref2),
+  {error, empty} = disk_queue:dequeue(Ref2),
+  ok = disk_queue:stop(Ref2),
   ok.
 
 -else.
