@@ -25,7 +25,7 @@
         ]).
 
 %%%_* Includes =========================================================
-%% -include_lib("disk_queue/include/disk_queue.hrl").
+-include_lib("disk_queue/include/disk_queue.hrl").
 -include_lib("kernel/include/file.hrl").
 
 %%%_* Macros ===========================================================
@@ -74,9 +74,9 @@ init(Args) ->
   {ok, Path} = assoc(path, Args),
   {ok, Size} = assoc(size, Args),
   ensure_path(Path),
-  case lists:sort(filelib:wildcard(filename:join([Path, "dq_*"]))) of
-    [] -> init_new(Path, Size);
-    Fs -> init_old(Path, Size, Fs)
+  case file:list_dir(Path) of
+    {ok, []} -> init_new(Path, Size);
+    {ok, Fs} -> init_old(Path, Size, lists:sort(Fs))
   end.
 
 terminate(_Rsn, #s{archive=Archive, active=Active}) ->
@@ -119,7 +119,7 @@ handle_cast(_Msg, S) ->
   {stop, bad_cast, S}.
 
 handle_info(Msg, S) ->
-  %% ?warning("~p", [Msg]),
+  ?warning("~p", [Msg]),
   {noreply, S}.
 
 code_change(_OldVsn, S, _Extra) ->
@@ -136,10 +136,10 @@ init_new(Path, Size) ->
          , r_ptr   = 0
          , w_ptr   = 0}}.
 
-init_old(Path, Size, Fs0) ->
-  {ArchiveFiles, ActiveFile} = lists:split(erlang:length(Fs0)-1, Fs0),
-  Archive = open_archive(ArchiveFiles),
-  Active  = open_active(ActiveFile),
+init_old(Path, Size, Fs) ->
+  {ArchiveFiles, [ActiveFile]} = lists:split(erlang:length(Fs)-1, Fs),
+  Archive = open_archive(Path, ArchiveFiles),
+  Active  = open_active(Path, ActiveFile),
   Start   = case Archive of
               []    -> Active#f.start;
               [F|_] -> F#f.start
@@ -152,14 +152,16 @@ init_old(Path, Size, Fs0) ->
          , r_ptr   = RPtr
          , w_ptr   = WPtr}}.
 
-open_archive(Fs) ->
-  lists:map(fun(F) ->
+open_archive(Path, Fs) ->
+  lists:map(fun(F0) ->
+                F = filename:join([Path, F0]),
                 {ok, #file_info{size=Size}} = file:read_file_info(F),
                 {ok, Fd} = file:open(F, [read, binary]),
                 #f{name=F, fd=Fd, start=filename_parse(F), size=Size}
             end, Fs).
 
-open_active(F) ->
+open_active(Path, F0) ->
+  F = filename:join([Path, F0]),
   {ok, #file_info{size=Size}} = file:read_file_info(F),
   {ok, Fd} = file:open(F, [read, write, binary]),
   #f{name=F, fd=Fd, start=filename_parse(F), size=Size}.
@@ -287,12 +289,11 @@ ensure_path(Path) ->
   filelib:ensure_dir(filename:join([Path, "dummy"])).
 
 filename_create(Path, Offset) ->
-  Fn = lists:flatten(io_lib:format("dq_~20..0B", [Offset])),
+  Fn = lists:flatten(io_lib:format("~20..0B", [Offset])),
   filename:join([Path, Fn]).
 
-filename_parse(Fn) ->
-  "dq_" ++ Offset = filename:basename(Fn),
-  erlang:list_to_integer(Offset).
+filename_parse(F) ->
+  erlang:list_to_integer(filename:basename(F)).
 
 assoc(K, L) ->
   case lists:keyfind(K, 1, L) of
@@ -306,10 +307,11 @@ assoc(K, L) ->
 
 clean_dir(Path) ->
   ensure_path(Path),
+  {ok, Fs} = file:list_dir(Path),
   lists:foreach(fun(F) ->
-                    ok = file:delete(F)
+                    ok = file:delete(filename:join([Path, F]))
                 end,
-                filelib:wildcard(filename:join([Path, "dq_*"]))).
+                Fs).
 
 basic_test() ->
   clean_dir("tmp"),
@@ -348,8 +350,9 @@ short_read_test() ->
   ok = disk_queue:enqueue(Ref1, foo),
   ok = disk_queue:enqueue(Ref1, bar),
   ok = disk_queue:stop(Ref1),
-  Files = lists:sort(filelib:wildcard(filename:join(["tmp", "dq_*"]))),
-  [Lastfile|_] = lists:reverse(Files),
+  {ok, Fs0} = file:list_dir("tmp"),
+  Fs = [filename:join(["tmp", F]) || F <- Fs0],
+  [Lastfile|_] = lists:reverse(Fs),
   {ok, Fd} = file:open(Lastfile, [append, binary]),
   ok = file:write(Fd, <<?t_hdr:8/integer>>),
   ok = file:close(Fd),
