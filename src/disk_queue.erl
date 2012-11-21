@@ -34,9 +34,9 @@
 
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
--record(f, { name  = undefined
+-record(f, { name  = throw(name)
            , start = 0
-           , fd    = undefined
+           , fd    = throw(fd)
            , size  = 0
            }).
 
@@ -76,7 +76,7 @@ init(Args) ->
   ensure_path(Path),
   case file:list_dir(Path) of
     {ok, []} -> init_new(Path, Size);
-    {ok, Fs} -> init_old(Path, Size, lists:sort(Fs))
+    {ok, Fs} -> init_old(Path, Size, sort(Fs))
   end.
 
 terminate(_Rsn, #s{archive=Archive, active=Active}) ->
@@ -101,7 +101,8 @@ handle_call(dequeue, _From, S) ->
                              , r_ptr   = RPtr
                              , w_ptr   = WPtr}};
     {error, empty} ->
-      %% possible to move readpointer to writepointer..
+      %% set readpointer to writepointer, this allows us to avoid
+      %% traversing a bunch of marks (which may exist).
       {reply, {error, empty}, S#s{ archive = Archive0
                                  , active  = Active0
                                  , r_ptr   = S#s.w_ptr}}
@@ -111,7 +112,8 @@ handle_call(peek, _From, S) ->
     {ok, Term} ->
       {reply, {ok, Term}, S};
     {error, empty} ->
-      %% possible to move readpointer to writepointer..
+      %% set readpointer to writepointer, this allows us to avoid
+      %% traversing a bunch of marks (which may exist).
       {reply, {error, empty}, S#s{r_ptr=S#s.w_ptr}}
   end.
 
@@ -127,7 +129,7 @@ code_change(_OldVsn, S, _Extra) ->
 
 %%%_ * Internals Init --------------------------------------------------
 init_new(Path, Size) ->
-  Fn = filename_create(Path, 0),
+  Fn = filename(Path, 0),
   {ok, Fd} = file:open(Fn, [read, write, binary]),
   {ok, #s{ path    = Path
          , size    = Size
@@ -138,8 +140,8 @@ init_new(Path, Size) ->
 
 init_old(Path, Size, Fs) ->
   {ArchiveFiles, [ActiveFile]} = lists:split(erlang:length(Fs)-1, Fs),
-  Archive = open_archive(Path, ArchiveFiles),
-  Active  = open_active(Path, ActiveFile),
+  Archive = [open_file(Path, F, [read, binary]) || F <- ArchiveFiles],
+  Active  =  open_file(Path, ActiveFile, [read, write, binary]),
   Start   = case Archive of
               []    -> Active#f.start;
               [F|_] -> F#f.start
@@ -152,19 +154,11 @@ init_old(Path, Size, Fs) ->
          , r_ptr   = RPtr
          , w_ptr   = WPtr}}.
 
-open_archive(Path, Fs) ->
-  lists:map(fun(F0) ->
-                F = filename:join([Path, F0]),
-                {ok, #file_info{size=Size}} = file:read_file_info(F),
-                {ok, Fd} = file:open(F, [read, binary]),
-                #f{name=F, fd=Fd, start=filename_parse(F), size=Size}
-            end, Fs).
-
-open_active(Path, F0) ->
-  F = filename:join([Path, F0]),
-  {ok, #file_info{size=Size}} = file:read_file_info(F),
-  {ok, Fd} = file:open(F, [read, write, binary]),
-  #f{name=F, fd=Fd, start=filename_parse(F), size=Size}.
+open_file(Path, F, Mode) ->
+  Fn = filename:join([Path, F]),
+  {ok, #file_info{size=Size}} = file:read_file_info(Fn),
+  {ok, Fd} = file:open(Fn, Mode),
+  #f{name=Fn, fd=Fd, start=start_offset(Fn), size=Size}.
 
 traverse(Archive, Active, Offset, RPtr) ->
   case read_next(Archive, Active, Offset) of
@@ -179,6 +173,9 @@ traverse(Archive, Active, Offset, RPtr) ->
       %% this is ok if it's the last file
       {RPtr, Offset}
   end.
+
+sort(Fs) ->
+  lists:sort(fun(A, B) -> start_offset(A) < start_offset(B) end, Fs).
 
 %%%_ * Internals Enqueue/Dequeue/Peek ----------------------------------
 do_enqueue(Term, File, WPtr) ->
@@ -267,7 +264,7 @@ maybe_switch(Archive, #f{size=Size} = Active, _Path, MaxSize)
 maybe_switch(Archive, Active, Path, _Size) ->
   ok          = file:sync(Active#f.fd),
   ok          = file:close(Active#f.fd),
-  NewName     = filename_create(Path, Active#f.start+Active#f.size),
+  NewName     = filename(Path, Active#f.start+Active#f.size),
   {ok, OldFd} = file:open(Active#f.name, [read, binary]),
   {ok, NewFd} = file:open(NewName, [read, write, binary]),
   {Archive++[Active#f{fd=OldFd}],
@@ -288,12 +285,12 @@ pread(Fd, Offset, Bytes) ->
 ensure_path(Path) ->
   filelib:ensure_dir(filename:join([Path, "dummy"])).
 
-filename_create(Path, Offset) ->
+filename(Path, Offset) ->
   Fn = lists:flatten(io_lib:format("~20..0B", [Offset])),
   filename:join([Path, Fn]).
 
-filename_parse(F) ->
-  erlang:list_to_integer(filename:basename(F)).
+start_offset(Fn) ->
+  erlang:list_to_integer(filename:basename(Fn)).
 
 assoc(K, L) ->
   case lists:keyfind(K, 1, L) of
